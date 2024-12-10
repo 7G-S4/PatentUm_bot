@@ -1,81 +1,43 @@
+import asyncio
 import json
 import os
 
-import telebot
-from huggingface_hub import InferenceClient
-from transformers import AutoModel
+from telebot.async_telebot import AsyncTeleBot
 
 from model_former import PatModel
 
-users_messages = 3
-
-
-
-model = PatModel('DiTy/gemma-2-9b-it-russian-strict-function-calling-DPO')
-model.load_model()
-
-bot = telebot.TeleBot('7877867673:AAEnQ7zOUM1qmcTkpusvBin_jPtjrcOeK68')
+bot = AsyncTeleBot('7877867673:AAEnQ7zOUM1qmcTkpusvBin_jPtjrcOeK68')
 
 if not os.path.exists("users"):
     os.mkdir("users")
 
+model = PatModel(
+"sk-proj-jV89dvc6yJsm4mPMw4Jet9u03tkMvMvPUpiC65lPiwXBgqzKq2WP7jHEwBlxiAGLZQWG3kbNH_T3BlbkFJxRXw5llEE7HKnTOcI6-x"
+"-1zAHq9N97S4J6RHHKf5UInkknUYGPsyaN2QnbCylhHj9H58Qt13wA","http://ucFtqS:92aPdD@196.18.14.7:8000")
+model.load_model("gpt-3.5-turbo-1106", 5)
+
+info = """Доступные функции:
+*   Сложение чисел.
+*   Предоставление информации о патенте по его номеру.
+Запросы могут долго обрабатываться. В связи с введёнными ограничениями, для подключения к OpenAI API используется германский прокси.
+Текущая модель: {}
+Максимальное кол-во сообщений, хранящихся в памяти модели: {}""".format(model.model, model.memory_cells)
+
 @bot.message_handler(commands=['start', 'info'])
-def start(message):
-    bot.send_message(chat_id=message.chat.id,
-                     text="""
-Привет! Я ИИ-ассистент в сфере интеллектуальной собственности. Задавайте мне вопросы, касающейся данной темы, а я \
-постараюсь вам помочь.
-    """)
+async def start(message):
+    await bot.send_message(chat_id=message.chat.id,
+                           text="Привет! Я ИИ-ассистент в сфере интеллектуальной собственности. Могу отвечать на вопрос"
+                                "ы, связанные с данной сферой, и выполнять некоторые функции. "+info)
 
 @bot.message_handler(commands=['clear'])
-def clear(message):
-    with open(f'users/{message.chat.id}.json', 'w', encoding='utf-8') as file:
-        oldmes = {'text': [{"role": "system",
-                                      "content": prompt}]}
-        json.dump(oldmes, file, ensure_ascii=False)
-    bot.send_message(chat_id=message.chat.id, text='История очищена!')
-
-@bot.message_handler(commands=['reload'])
-def reload(message):
-    bot.send_message(chat_id=message.chat.id, text='Промпты модели обновлены!')
+async def clear(message):
+    model.clear_message_history(fr"users/{message.chat.id}.json")
+    await bot.send_message(chat_id=message.chat.id, text='История очищена!')
 
 @bot.message_handler(content_types=['text'])
-def msg(message):
-    if f"{message.chat.id}.json" not in os.listdir('users'):
-        with open(f"users/{message.chat.id}.json", "w", encoding='utf-8') as file:
-            oldmes = {'text': [{"role": "system", "content": prompt}]}
-            json.dump(oldmes, file, ensure_ascii=False)
+async def msg(message):
+    send_message = await bot.send_message(chat_id=message.chat.id, text='Обрабатываю запрос, пожалуйста подождите!')
+    answer = await model.get_response(message.text, fr"users/{message.chat.id}.json")
+    await bot.edit_message_text(text=answer, chat_id=message.chat.id, message_id=send_message.message_id)
 
-    with open(f'users/{message.chat.id}.json', 'r', encoding='utf-8') as file:
-        oldmes = json.load(file)
-
-    try:
-        send_message = bot.send_message(chat_id=message.chat.id, text='Обрабатываю запрос, пожалуйста подождите!')
-
-        oldmes['text'].append({'role': 'user', 'content': message.text})
-        #{'role': 'system', 'content': remind},
-        ai_messages = (oldmes['text'][:-1] + [oldmes['generated_text'][-1]])
-        res = client.chat_completion(
-            messages=ai_messages,
-            tools=tools,
-            tool_choice="auto",
-            max_tokens=10000,
-        )
-        bot.edit_message_text(text=res.choices[0].message.tool_calls[0].function.name, chat_id=message.chat.id,
-                              message_id=send_message.message_id)
-        #oldmes['generated_text'].append(res[0]['generated_text'][-1])
-        #with open(f'users/{message.chat.id}.json', 'w', encoding='utf-8') as file:
-        #    k = 0
-        #    n = len(oldmes['generated_text'])-1
-        #    for ai_dict_idx in range(n, -1, -1):
-        #        if oldmes['generated_text'][ai_dict_idx]['role'] == "user": k += 1
-        #        if k > users_messages:
-        #            del oldmes['generated_text'][ai_dict_idx+1]
-        #            del oldmes['generated_text'][ai_dict_idx]
-        #            break
-        #    json.dump(oldmes, file, ensure_ascii=False)
-
-    except Exception as e:
-        bot.send_message(chat_id=message.chat.id, text="Ошибка:\n" + str(e))
-
-bot.infinity_polling()
+asyncio.run(bot.infinity_polling())

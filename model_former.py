@@ -1,135 +1,118 @@
+import asyncio
 import json
 import os
 
-from torch import bfloat16
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from multi_func import func_multiplier
+import httpx
+from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCall
+from openai.types.chat.chat_completion import Choice
 
 from selectable_functions import Functions
+from openai import AsyncOpenAI
+from transformers.utils import get_json_schema  # (choices: ["tea", "coffee"]) для аргументов
+
+ChatCompletionMessage.model_config['from_attributes']=True
 
 
 
 
 class PatModel:
-    def __init__(self, model_str: str):
-        self.model_str = model_str
-        self.model = None
-        self.tokenizer = None
-        self.path_to_prompt = None
+    def __init__(self, api_key: str, proxy: str, path_to_prompt:str="prompt.txt") -> None:
+        self.api_key = api_key
+        self.proxy = proxy
+        self.path_to_prompt = path_to_prompt
         self.prompt = None
         self.tools = None
-        self.multi_tools = None
-        self.memory_cells = 3
+        self.client = None
+        self.model = None
+        self.memory_cells = None
 
-    def load_model(self, path_to_prompt:str="prompt.txt", gpu:bool=True):
-        self.path_to_prompt = path_to_prompt
+    def load_model(self, model:str, memory_cells:int) -> None:
         self.reload_prompt()
         self.reload_tools()
+        self.client = AsyncOpenAI(http_client=httpx.AsyncClient(proxy=self.proxy, timeout=35),api_key=self.api_key)
+        self.model = model
+        self.memory_cells = memory_cells
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_str,
-            device_map="cuda" if gpu else "auto",
-            torch_dtype=bfloat16# use float16 or float32 if bfloat16 is not available to you.
+    async def model_step(self, history_message: list[dict[str: str]]) -> Choice:
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=history_message,
+            tools=self.tools
         )
-        self.model.save_pretrained(r"patent_model/model")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_str,
-            device_map="cuda" if gpu else "auto"
-        )
+        return response.choices[0]
 
-    def model_step(self, history_message:list[dict[str:str]], multy_func:bool, tools:list[any]=None):
-        inputs = self.tokenizer.apply_chat_template(
-            history_message,
-            tokenize=False,
-            add_generation_prompt=True,  # adding prompt for generation
-            tools=(self.multi_tools if multy_func else self.tools) if tools is None else tools
-        )
-        terminator_ids = [
-            self.tokenizer.eos_token_id,
-            self.tokenizer.convert_tokens_to_ids("<end_of_turn>"),
-        ]
-        prompt_ids = self.tokenizer.encode(inputs, add_special_tokens=False, return_tensors='pt').to(self.model.device)
-        generated_ids = self.model.generate(
-            prompt_ids,
-            do_sample=True,
-            temperature=0.2,
-            top_k=40,
-            top_p=0.95,
-            min_p=0.5,
-            max_new_tokens=512,
-            eos_token_id=terminator_ids,
-            bos_token_id=self.tokenizer.bos_token_id
-        )
+    async def get_response(self, message:str, path_to_history:str) -> str:
+        history_messages = self.get_history(path_to_history)
+        history_messages.append({"role": "user", "content": message})
+        generated_response = await self.model_step(history_messages)
 
-        generated_response = self.tokenizer.decode(generated_ids[0][prompt_ids.shape[-1]:], skip_special_tokens=False)
-        return generated_response
-
-    def get_response(self, message:str, path_to_history:str, multy_func:bool=False):
-        history_messages = []
-        generated_response = self.model_step([{"role": "user", "content": message}], multy_func)
-        if "Вызов функции: {" in generated_response:
-            generated_response = generated_response[generated_response.find('{'):generated_response.find('<')]
-            response_dict = json.loads(generated_response)
-            func = getattr(self, response_dict['name'])
+        if generated_response.finish_reason == 'tool_calls':
             try:
-                returnable_value = func(**response_dict['arguments'])
+                funcs_result = await self.all_func_run(generated_response.message.tool_calls)
             except Exception as e:
                 return 'Ошибка:\n' + str(e)
-            history_messages.append({"role": "user", "content": message})
-            if func.is_answer:
-                generated_response = func.answer.replace("val", str(returnable_value))
-            else:
-                history_messages.append({"role": "function-call", "content": generated_response})
-                history_messages.append({"role": "function-response", "content": str({func.name_returnable_value:
-                                                                                          returnable_value})})
-                generated_response = self.model_step(history_messages, multy_func)
-                del history_messages[-1], history_messages[-1]
-                generated_response = generated_response[:generated_response.find("<")]
-            history_messages.append({"role": "model","content": generated_response})
+            history_messages.append(generated_response.message)
+            history_messages += funcs_result
 
-            print(history_messages)
-            messages_count = sum(1 for message in history_messages if message['role']=='user')
-            if messages_count == self.memory_cells+1:
-                del history_messages[1], history_messages[1]
-            self.update_history(history_messages, path_to_history)
-            return generated_response
-        else:
-            history_messages.append({"role": "user", "content": message})
-            generated_response = generated_response[:generated_response.find('<')]
-            history_messages.append({"role": "model", "content": generated_response})
-            self.update_history(history_messages, path_to_history)
-            return generated_response
+            generated_response = await self.model_step(history_messages)
 
-    def reload_prompt(self):
+        history_messages.append({"role": "assistant", "content": generated_response.message.content})
+        for idx in range(len(history_messages)):
+            if type(history_messages[idx]) != dict:
+                history_messages[idx] = history_messages[idx].to_dict()
+                history_messages[idx]["to_dict_product"] = 1
+        user_messages_count = sum(1 for message in history_messages if message['role'] == 'user')
+        if user_messages_count == self.memory_cells + 1:
+            del history_messages[1]
+            while history_messages[1]['role'] != 'user':
+                del history_messages[1]
+        self.update_history(history_messages, path_to_history)
+        return generated_response.message.content
+
+    async def all_func_run(self, functions: list[ChatCompletionMessageToolCall]) -> list[dict[str:str]]:
+        tasks = []
+        for func in functions:
+            tasks.append(
+                asyncio.create_task(getattr(Functions(), func.function.name)(**json.loads(func.function.arguments))))
+        await asyncio.gather(*tasks)
+        ret_values = [task.result() for task in tasks]
+        final = []
+        for ret_value, func in zip(ret_values, functions):
+            final.append({
+                "role": "tool",
+                "content": json.dumps(json.loads(func.function.arguments) |
+                                      {f"{getattr(Functions(), func.function.name).ret_value_name}": ret_value},
+                                      ensure_ascii=False),
+                "name": func.function.name,
+                "tool_call_id": func.id
+            })
+        return final
+
+    def reload_prompt(self) -> None:
         with open(self.path_to_prompt, "r", encoding='utf-8') as file:
             self.prompt = '\n'.join(file.readlines())
 
-    def reload_tools(self):
+    def reload_tools(self) -> None:
         Functions.__init__(self)
-        self.tools = [getattr(Functions(), func) for func in dir(Functions()) if callable(getattr(Functions(), func)) and not func.startswith("__")]
-        #self.multi_tools = func_multiplier(self.tools)
+        self.tools = [get_json_schema(getattr(Functions(), func)) for func in dir(Functions())
+                      if callable(getattr(Functions(), func)) and not func.startswith("__")]
 
 
-    def clear_message_history(self, path_to_history:str):
+    def clear_message_history(self, path_to_history:str) -> None :
         with open(path_to_history, 'w', encoding='utf-8') as file:
-            history_messages = {'text': [{"role": "system",
-                                "content": self.prompt}]}
+            history_messages = [{"role": "system", "content": self.prompt}]
             json.dump(history_messages, file, ensure_ascii=False)
 
-    def get_history(self, path_to_history:str):
+    def get_history(self, path_to_history:str) -> list[dict[str:str]]:
         if not os.path.exists(path_to_history):
             self.clear_message_history(path_to_history)
         with open(path_to_history, 'r', encoding='utf-8') as file:
-            history_messages = json.load(file)['text']
-
+            history_messages = json.load(file)
+        for idx in range(len(history_messages)):
+            if history_messages[idx].get("to_dict_product", 0):
+                history_messages[idx] = ChatCompletionMessage.model_validate(history_messages[idx])
         return history_messages
 
-    def update_history(self, new_history_messages:list[dict[str:str]], path_to_history:str):
-        history_messages = self.get_history(path_to_history)
-        history_messages += new_history_messages
+    def update_history(self, history_messages:list[dict[str: str]], path_to_history:str):
         with open(path_to_history, 'w', encoding='utf-8') as file:
-            history_messages = {'text': history_messages}
             json.dump(history_messages, file, ensure_ascii=False)
-
-    def reformat_history(self,):pass
